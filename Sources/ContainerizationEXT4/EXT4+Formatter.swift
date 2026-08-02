@@ -29,6 +29,7 @@ extension EXT4 {
         var blockSize: UInt32 { 1024 << logBlockSize }
         private var size: UInt64
         private let groupDescriptorSize: UInt32 = 32
+        private let inodeStrideKiB: UInt32 = 512
 
         private var blocksPerGroup: UInt32 {
             blockSize * 8
@@ -610,6 +611,29 @@ extension EXT4 {
             throw Error.unsupportedFiletype
         }
 
+        let markAllocatedRange:
+            (
+                UInt64,
+                UInt64,
+                UInt64,
+                UInt64,
+                inout [UInt8]
+            ) -> UInt32 = { start, end, groupStart, groupEnd, bitmap in
+                let clippedStart = max(start, groupStart)
+                let clippedEnd = min(end, groupEnd)
+
+                guard clippedStart < clippedEnd else {
+                    return 0
+                }
+
+                for block in clippedStart..<clippedEnd {
+                    let localBlock = UInt32(block - groupStart)
+                    bitmap[Int(localBlock / 8)] |= 1 << (localBlock % 8)
+                }
+
+                return UInt32(clippedEnd - clippedStart)
+            }
+
         //  Completes the formatting of an ext4 filesystem after writing the necessary structures.
         //
         //  This function is responsible for finalizing the formatting process of an ext4 filesystem
@@ -671,13 +695,9 @@ extension EXT4 {
             let bitmapOffset = self.currentBlock
             let bitmapBlocks: UInt32 = blockGroupSize.blockGroups * 2  // each group has two bitmaps - for inodes, and for blocks
             let dataBlocks: UInt32 = bitmapOffset + bitmapBlocks  // last data block
-            var diskBlocks = dataBlocks
             var contentRequiredBlocks = (blockGroupSize.blockGroups - 1) * self.blocksPerGroup + 1
             if blockGroupSize.blockGroups == 1 {
                 contentRequiredBlocks = self.blocksPerGroup  // at least 1 block group
-            }
-            if diskBlocks < contentRequiredBlocks {  // for data + metadata
-                diskBlocks = contentRequiredBlocks
             }
             let contentRequiredSize = UInt64(contentRequiredBlocks) * self.blockSize
             // minDiskSize is usable capacity; the journal is additive on top.
@@ -685,35 +705,49 @@ extension EXT4 {
             if newSize < contentRequiredSize {
                 newSize = contentRequiredSize
             }
-            // number of blocks needed for group descriptors
-            let groupDescriptorBlockCount: UInt32 = (blockGroupSize.blockGroups - 1) / self.groupsPerDescriptorBlock + 1
-            guard groupDescriptorBlockCount <= self.groupDescriptorBlocks else {
-                throw Error.insufficientSpaceForGroupDescriptorBlocks
-            }
 
             var totalBlocks: UInt32 = 0
             var totalInodes: UInt32 = 0
             let inodeTableSizePerGroup: UInt32 = blockGroupSize.inodesPerGroup * EXT4.InodeSize / self.blockSize
             var groupDescriptors: [GroupDescriptor] = []
 
-            let minGroups = (((self.pos / UInt64(self.blockSize)) - 1) / UInt64(self.blocksPerGroup)) + 1
-            if newSize < minGroups * blocksPerGroup * blockSize {
-                newSize = UInt64(minGroups * blocksPerGroup * blockSize)
+            let minBlocks = UInt64(dataBlocks)
+            if newSize < minBlocks * UInt64(self.blockSize) {
+                newSize = minBlocks * UInt64(self.blockSize)
             }
-            let totalGroups = (((newSize / UInt64(self.blockSize)) - 1) / UInt64(self.blocksPerGroup)) + 1
 
-            // If the provided disk size is not aligned to a blockgroup boundary, it needs to
-            // be expanded to the next blockgroup boundary.
-            // Example:
-            //  Provided disk size: 2 GB + 100MB: 2148 MB
-            //  BlockSize: 4096
-            //  Blockgroup size: 32768 blocks: 128MB
-            //  Number of blocks: 549888
-            //  Number of blockgroups = 549888 / 32768 = 16.78125
-            //  Aligned disk size = 557056 blocks = 17 blockgroups: 2176 MB
-            if newSize < totalGroups * blocksPerGroup * blockSize {
-                newSize = UInt64(totalGroups * blocksPerGroup * blockSize)
+            // Preserve the requested filesystem size exactly when possible.
+            // Any trailing partial group is kept as-is; we do not round up to a full
+            // block-group boundary just to place that group's metadata.
+            //
+            // For groups beyond blockGroupSize.blockGroups, metadata is packed into a
+            // reserved region starting at dataBlocks:
+            // - inode table: inodeTableSizePerGroup blocks
+            // - block bitmap: 1 block
+            // - inode bitmap: 1 block
+            //
+            // This keeps descriptor pointers in-bounds even when the last group is tiny
+            // (for example, 128 MiB + 4 KiB), while still preserving exact-size images
+            // for larger partial tails (for example, 160 MiB).
+
+            let fsBlocks: UInt64 = (newSize + UInt64(self.blockSize) - 1) / UInt64(self.blockSize)  // round up to block boundary
+
+            let totalGroups = ((fsBlocks - 1) / UInt64(self.blocksPerGroup)) + 1  // round up to group boundary
+            let groupDescriptorBlockCount: UInt32 = (UInt32(totalGroups) - 1) / self.groupsPerDescriptorBlock + 1  // round up to descriptor block boundary
+            guard groupDescriptorBlockCount <= self.groupDescriptorBlocks else {
+                throw Error.insufficientSpaceForGroupDescriptorBlocks
             }
+            let extraGroupCount = UInt64(UInt32(totalGroups) - blockGroupSize.blockGroups)  // count of groups beyond blockGroupSize.blockGroups that require packed metadata layout
+            let packedBitmapStart = UInt64(dataBlocks)
+            let packedBitmapBlocks = extraGroupCount * 2
+            let packedBitmapEnd = packedBitmapStart + packedBitmapBlocks
+
+            let packedInodeTableStart = packedBitmapEnd
+            let packedInodeTableBlocks = extraGroupCount * UInt64(inodeTableSizePerGroup)
+            let packedMetadataEnd = UInt32(packedInodeTableStart + packedInodeTableBlocks)
+
+            // Only the normal metadata prefix is contiguous with group zero.
+            let reservedDataBlocks = dataBlocks
             // Snapshot groupDescriptorBlocks before self.size potentially changes: the bitmap
             // loop uses this to identify which GDT slots were physically reserved at init time,
             // so it can mark any unused slots as free without accidentally freeing content blocks
@@ -724,13 +758,12 @@ extension EXT4 {
                     throw Error.cannotResizeFS(newSize)
                 }
                 self.size = newSize
-                let pos = self.pos
-                guard lseek(self.handle.fileDescriptor, off_t(self.size - 1), 0) == self.size - 1 else {
+                // Growing an already-materialized file via lseek+write forces the whole new
+                // range to be physically allocated on some filesystems (for example APFS).
+                // ftruncate leaves it as a sparse hole and doesn't disturb the file position.
+                guard ftruncate(self.handle.fileDescriptor, off_t(self.size)) == 0 else {
                     throw Error.cannotResizeFS(self.size)
                 }
-                let zero: [UInt8] = [0]
-                try self.handle.write(contentsOf: zero)
-                try self.handle.seek(toOffset: pos)
             }
             for group in 0..<blockGroupSize.blockGroups {
                 // keep track of directories, inodes and block per blockgroup
@@ -739,17 +772,42 @@ extension EXT4 {
                 var blocks: UInt32 = 0
                 // blocks bitmap
                 var bitmap: [UInt8] = .init(repeating: 0, count: self.blockSize * 2)  // 1 for blocks, 1 for inodes
-                if (group + 1) * UInt32(self.blocksPerGroup) <= dataBlocks {  // fully allocated group
+                let groupStart = UInt64(group) * UInt64(self.blocksPerGroup)
+                guard groupStart < fsBlocks else {
+                    continue
+                }
+                let groupBlockCount = UInt32(
+                    min(UInt64(self.blocksPerGroup), fsBlocks - groupStart)
+                )
+                let groupEnd = groupStart + UInt64(groupBlockCount)
+                if (group + 1) * UInt32(self.blocksPerGroup) <= reservedDataBlocks {  // fully allocated group
                     for i in 0..<(self.blockSize) {
                         bitmap[Int(i)] = 0xff  // mark as allocated
                     }
                     blocks = UInt32(self.blocksPerGroup)
-                } else if group * UInt32(self.blocksPerGroup) < dataBlocks {  // partially allocated group
-                    for i in 0..<dataBlocks - group * UInt32(self.blocksPerGroup) {
+                } else if group * UInt32(self.blocksPerGroup) < reservedDataBlocks {  // partially allocated group
+                    for i in 0..<reservedDataBlocks - group * UInt32(self.blocksPerGroup) {
                         bitmap[Int(i / 8)] |= 1 << (i % 8)
                         blocks += 1
                     }
                 }
+                let packedBitmapBlocksInGroup = markAllocatedRange(
+                    packedBitmapStart,
+                    packedBitmapEnd,
+                    groupStart,
+                    groupEnd,
+                    &bitmap
+                )
+
+                let packedInodeTableBlocksInGroup = markAllocatedRange(
+                    packedInodeTableStart,
+                    UInt64(packedMetadataEnd),
+                    groupStart,
+                    groupEnd,
+                    &bitmap
+                )
+
+                blocks += packedBitmapBlocksInGroup + packedInodeTableBlocksInGroup
 
                 if group == 0 {  // unused group descriptor blocks
                     // blocks used by group descriptors
@@ -766,16 +824,11 @@ extension EXT4 {
                     }
                 }
 
-                // last blockGroup if not aligned with total size should be marked as allocated
-                let remainingBlocks = diskBlocks % self.blocksPerGroup
-                if group == totalGroups - 1 && remainingBlocks != 0 && self.size / self.blockSize < self.blocksPerGroup {
-                    for i in remainingBlocks..<self.blocksPerGroup {
+                // The true last group may be smaller than blocksPerGroup; blocks beyond
+                // groupBlockCount don't physically exist and must be marked used.
+                if groupBlockCount < self.blocksPerGroup {
+                    for i in groupBlockCount..<self.blocksPerGroup {
                         bitmap[Int(i / 8)] |= 1 << (i % 8)
-                    }
-                    if remainingBlocks < self.size / self.blockSize {
-                        for i in remainingBlocks..<self.size / self.blockSize {
-                            bitmap[Int(i / 8)] &= ~(1 << (i % 8))
-                        }
                     }
                 }
 
@@ -819,7 +872,7 @@ extension EXT4 {
                 let blockBitmap = UInt64(bitmapOffset + 2 * group)
                 let inodeBitmap = UInt64(bitmapOffset + 2 * group + 1)
                 let inodeTable = inodeTableOffset + UInt64(group * inodeTableSizePerGroup)
-                let freeBlocksCount = UInt32(self.blocksPerGroup - blocks)
+                let freeBlocksCount = UInt32(groupBlockCount - blocks)
                 let freeInodesCount = UInt32(blockGroupSize.inodesPerGroup - inodes)
                 groupDescriptors.append(
                     // low bits
@@ -843,21 +896,53 @@ extension EXT4 {
 
             // Since the bitmaps for unoccupied block groups are the same, there is no need
             // to allocate separate memory or storage for each individual bitmap.
-            var blockBitmap: [UInt8] = .init(repeating: 0, count: Int(self.blocksPerGroup) / 8)
+            let blockBitmap: [UInt8] = .init(repeating: 0, count: Int(self.blocksPerGroup) / 8)
             var inodeBitmap: [UInt8] = .init(repeating: 0xff, count: Int(self.blocksPerGroup) / 8)
-            for i in 0..<inodeTableSizePerGroup + 2 {
-                blockBitmap[Int(i) / 8] |= 1 << (i % 8)
-            }
             for i in 0..<UInt16(blockGroupSize.inodesPerGroup) {
                 inodeBitmap[Int(i) / 8] &= ~(1 << (i % 8))
             }
             for group in blockGroupSize.blockGroups..<totalGroups.lo {
-                let blocksInGroup = UInt32(self.blocksPerGroup)
-                let blockBitmapOffset = UInt64(group * self.blocksPerGroup + inodeTableSizePerGroup)
-                let inodeBitmapOffset = UInt64(group * self.blocksPerGroup + inodeTableSizePerGroup + 1)
-                let inodeTableOffset = UInt64(self.blocksPerGroup) * group
-                let freeBlocksCount = UInt32(blocksInGroup - inodeTableSizePerGroup - 2)
+                let groupStart = UInt64(group) * UInt64(self.blocksPerGroup)
+                let blocksInGroup = UInt32(min(UInt64(self.blocksPerGroup), fsBlocks - groupStart))
+                let groupEnd = groupStart + UInt64(blocksInGroup)
+
+                var groupBlockBitmap = blockBitmap
+                if blocksInGroup < self.blocksPerGroup {
+                    for i in blocksInGroup..<self.blocksPerGroup {
+                        groupBlockBitmap[Int(i / 8)] |= 1 << (i % 8)
+                    }
+                }
+
+                let extraGroupIndex = UInt64(group - blockGroupSize.blockGroups)
+
+                let blockBitmapOffset = packedBitmapStart + extraGroupIndex * 2
+                let inodeBitmapOffset = blockBitmapOffset + 1
+                let inodeTableOffset =
+                    packedInodeTableStart + extraGroupIndex * UInt64(inodeTableSizePerGroup)
+
+                let usedBitmapBlocks = markAllocatedRange(
+                    packedBitmapStart,
+                    packedBitmapEnd,
+                    groupStart,
+                    groupEnd,
+                    &groupBlockBitmap
+                )
+
+                let usedInodeTableBlocks = markAllocatedRange(
+                    packedInodeTableStart,
+                    UInt64(packedMetadataEnd),
+                    groupStart,
+                    groupEnd,
+                    &groupBlockBitmap
+                )
+
+                let usedBlocksInGroup = usedBitmapBlocks + usedInodeTableBlocks
+
+                totalBlocks += usedBlocksInGroup
+
+                let freeBlocksCount = blocksInGroup - usedBlocksInGroup
                 let freeInodesCount = UInt32(blockGroupSize.inodesPerGroup)
+
                 groupDescriptors.append(
                     // low bits
                     GroupDescriptor(
@@ -873,10 +958,11 @@ extension EXT4 {
                         inodeBitmapCsumLow: 0x0000,
                         itableUnusedLow: 0x0000,
                         checksum: 0x0000
-                    ))
-                totalBlocks += (inodeTableSizePerGroup + 2)
-                try self.seek(block: group * self.blocksPerGroup + inodeTableSizePerGroup)
-                try self.handle.write(contentsOf: blockBitmap)
+                    )
+                )
+
+                try self.seek(block: UInt32(blockBitmapOffset))
+                try self.handle.write(contentsOf: groupBlockBitmap)
                 try self.handle.write(contentsOf: inodeBitmap)
             }
 
@@ -890,10 +976,9 @@ extension EXT4 {
             // write superblock
             try self.seek(block: 0)
             try self.handle.write(contentsOf: Array<UInt8>.init(repeating: 0, count: 1024))
-
             let computedInodes = totalGroups * blockGroupSize.inodesPerGroup
-            var blocksCount = totalGroups * self.blocksPerGroup
-            while blocksCount < totalBlocks {
+            var blocksCount = (newSize + UInt64(self.blockSize) - 1) / UInt64(self.blockSize)
+            if blocksCount < totalBlocks {
                 blocksCount = UInt64(totalBlocks)
             }
             let totalFreeBlocks: UInt64
@@ -936,7 +1021,7 @@ extension EXT4 {
             if let config = journalConfig {
                 compatFeatures |= CompatFeature.hasJournal.rawValue
                 superblock.journalInum = EXT4.JournalInode
-                superblock.journalUUID = filesystemUUID
+                // superblock.journalUUID = filesystemUUID
                 superblock.journalBlocks = journalInodeBlockBackup()
                 superblock.journalBackupType = 1  // s_jnl_backup_type: 1 = s_jnl_blocks[] holds a valid inode backup
                 if let mode = config.defaultMode {
@@ -1024,11 +1109,9 @@ extension EXT4 {
             }
             let tableSize: UInt64 = UInt64(EXT4.InodeSize) * blockGroups * inodesPerGroup
             let rest = tableSize - UInt64(self.inodes.count) * EXT4.InodeSize
-            let zeroBlock = Array<UInt8>.init(repeating: 0, count: Int(self.blockSize))
-            for _ in 0..<(rest / self.blockSize) {
-                try self.handle.write(contentsOf: zeroBlock)
+            if rest > 0 {
+                try self.handle.seek(toOffset: self.pos + rest)
             }
-            try self.handle.write(contentsOf: Array<UInt8>.init(repeating: 0, count: Int(rest % self.blockSize)))
             return inodeTableOffset
         }
 
@@ -1053,8 +1136,7 @@ extension EXT4 {
 
             var groups: UInt32 = UInt32.max
             var inodesPerGroup: UInt32 = 0
-            let inc = Int(self.blockSize * 512) / Int(EXT4.InodeSize)  // inodesPerGroup
-            // minimizes the number of blockGroups needed to its lowest value
+            let inc = Int(self.blockSize * self.inodeStrideKiB) / Int(EXT4.InodeSize)  // minimizes the number of blockGroups needed to its lowest value
             for ipg in stride(from: inc, through: Int(self.maxInodesPerGroup), by: inc) {
                 let g = groupCount(blocks, inodes, UInt32(ipg))
                 if g < groups {

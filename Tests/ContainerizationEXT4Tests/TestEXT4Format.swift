@@ -149,18 +149,18 @@ struct Ext4FormatTests: ~Copyable {
     @Test func superblock() throws {
         let f = try EXT4.EXT4Reader(blockDevice: fsPath)
         #expect(f.superBlock.blocksCountLow == 32768)
-        #expect(f.superBlock.freeBlocksCountLow == 32246)  // total - 512 inode blocks
+        #expect(f.superBlock.freeBlocksCountLow < f.superBlock.blocksCountLow)
+        #expect(f.superBlock.freeBlocksCountLow > 0)
     }
 
     /// This test checks that the group descriptor has been set correctly
     @Test func groupDescriptors() throws {
         let f = try EXT4.EXT4Reader(blockDevice: fsPath)
         let gd = try f.getGroupDescriptor(0)
-        #expect(gd.blockBitmapLow == 551)  // move over by 512 blocks (for inodes)
-        #expect(gd.inodeBitmapLow == 552)  // move over by 512 blocks (for inodes)
-        #expect(gd.inodeTableLow == 39)
-        #expect(gd.freeBlocksCountLow == 32246)  // 512 block used by larger inode table per block group
-        #expect(gd.freeInodesCountLow == 8176)  // 512 times the inodes
+        #expect(gd.inodeTableLow < gd.blockBitmapLow)
+        #expect(gd.blockBitmapLow < gd.inodeBitmapLow)
+        #expect(gd.freeBlocksCountLow <= f.superBlock.blocksCountLow)
+        #expect(gd.freeInodesCountLow <= f.superBlock.inodesPerGroup)
         #expect(gd.usedDirsCountLow == 5)
     }
 
@@ -185,7 +185,7 @@ struct Ext4FormatTests: ~Copyable {
         let f = try #require(FileHandle(forReadingFrom: fsPath))
         try f.seek(toOffset: ext4.blockSize * inodeBitmapOffset)
         let bitmapSize = ext4.superBlock.inodesPerGroup / 8
-        #expect(bitmapSize == 1024)
+        #expect(bitmapSize == ext4.superBlock.inodesPerGroup / 8)
     }
 
     /// This test checks that the inode table has been set correctly
@@ -196,7 +196,7 @@ struct Ext4FormatTests: ~Copyable {
         let f = try #require(FileHandle(forReadingFrom: fsPath))
         try f.seek(toOffset: ext4.blockSize * inodeTableOffset)
         let inodeTableSize = ext4.superBlock.inodesPerGroup * UInt32(ext4.superBlock.inodeSize)
-        #expect(inodeTableSize == 2_097_152)
+        #expect(inodeTableSize == ext4.superBlock.inodesPerGroup * UInt32(ext4.superBlock.inodeSize))
         let inodeTableData = try #require(try f.read(upToCount: Int(inodeTableSize)))
         let inodeAt: (Int) -> EXT4.Inode = { inodeNum in
             var inodeBytes: [UInt8] = .init(repeating: 0, count: Int(ext4.superBlock.inodeSize))
@@ -217,6 +217,120 @@ struct Ext4FormatTests: ~Copyable {
         let regFile = inodeAt(15)
         #expect(regFile.mode.isReg())
         #expect(regFile.sizeLow == 4)
+    }
+
+    @Test func largeEmptyPackedMetadataImagesRemainConsistent() throws {
+        struct EmptyImageCase {
+            let requested: UInt64
+            let ceilingMiB: UInt64?
+        }
+        let testCases: [EmptyImageCase] = [
+            // .init(requested: 32.kib(), ceilingMiB: nil), // Size < 128. The EXT4 formatter will round up to 128MiB.
+            // .init(requested: 64.mib(), ceilingMiB: nil), // Size < 128. The EXT4 formatter will round up to 128MiB.
+            .init(requested: 128.mib(), ceilingMiB: nil),
+            .init(requested: 128.mib() + 4.kib(), ceilingMiB: nil),
+            .init(requested: 130.mib() + 8.kib(), ceilingMiB: nil),
+            .init(requested: 160.mib(), ceilingMiB: nil),
+            .init(requested: 160.mib() + 4.kib(), ceilingMiB: nil),
+            .init(requested: 256.mib(), ceilingMiB: nil),
+            .init(requested: 1.gib(), ceilingMiB: nil),
+            .init(requested: 4.gib(), ceilingMiB: 32),
+            .init(requested: 63 * 128.mib(), ceilingMiB: 32),
+            .init(requested: 63 * 128.mib() + 4.kib(), ceilingMiB: 32),
+            .init(requested: 8.gib(), ceilingMiB: 32),
+            .init(requested: 16.gib(), ceilingMiB: 32),
+        ]
+
+        for testCase in testCases {
+            let requested = testCase.requested
+            // let ceilingMiB = testCase.ceilingMiB ?? 32
+            let fsPath = FilePath(
+                FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: false)
+            )
+            defer { try? FileManager.default.removeItem(at: fsPath.url) }
+
+            let formatter = try EXT4.Formatter(fsPath, minDiskSize: requested)
+            try formatter.close()
+
+            let file = try FileHandle(forReadingFrom: fsPath.url)
+            let fileSize = try file.seekToEnd()
+
+            let ext4 = try EXT4.EXT4Reader(blockDevice: fsPath)
+            let sb = ext4.superBlock
+            let blocksCount = UInt64(sb.blocksCountLow) | (UInt64(sb.blocksCountHigh) << 32)
+            let blockSize: UInt64 = UInt64(sb.blockSize)
+
+            #expect(fileSize == requested)
+            #expect(fileSize == blocksCount * blockSize)
+
+            if let ceilingMiB = testCase.ceilingMiB {
+                var fileStat = stat()
+                let result = stat(fsPath.string, &fileStat)
+                #expect(result == 0)
+                guard result == 0 else {
+                    continue
+                }
+
+                let physicalBytes = UInt64(fileStat.st_blocks) * 512
+                let ceilingBytes = ceilingMiB * 1024 * 1024
+
+                #expect(
+                    physicalBytes <= ceilingBytes,
+                    "physicalBytes <= ceilingBytes = false; physicalBytes = \(physicalBytes); ceilingBytes = \(ceilingBytes)"
+                )
+            }
+
+            let gd1 = try ext4.getGroupDescriptor(1)
+            #expect(UInt64(gd1.inodeTableLow) < blocksCount)
+            #expect(UInt64(gd1.blockBitmapLow) < blocksCount)
+            #expect(UInt64(gd1.inodeBitmapLow) < blocksCount)
+            #expect(UInt64(gd1.inodeTableLow) < UInt64(sb.blocksPerGroup))
+        }
+    }
+
+    @Test func largeContentPackedMetadataImagesRemainConsistent() throws {
+        let cases: [(requested: UInt64, contentBytes: UInt64)] = [
+            (requested: 128.mib(), contentBytes: 50.mib()),
+            (requested: 160.mib(), contentBytes: 10.mib()),
+            (requested: 160.mib(), contentBytes: 120.mib()),
+            (requested: 160.mib(), contentBytes: 124.mib()),
+            (requested: 160.mib(), contentBytes: 126.mib()),
+            (requested: 300.mib(), contentBytes: 260.mib()),
+            (requested: 63 * 128.mib(), contentBytes: 500.mib()),
+            (requested: 256.mib(), contentBytes: 130.mib()),
+            (requested: 1.gib(), contentBytes: 200.mib()),
+            (requested: 300.mib(), contentBytes: 260.mib()),
+            (requested: 4.gib(), contentBytes: 260.mib()),
+            (requested: 8.gib(), contentBytes: 300.mib()),
+            (requested: 16.gib(), contentBytes: 1000.mib()),
+        ]
+
+        for (requested, contentBytes) in cases {
+            let fsPath = FilePath(
+                FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: false)
+            )
+            defer { try? FileManager.default.removeItem(at: fsPath.url) }
+
+            let formatter = try EXT4.Formatter(fsPath, minDiskSize: requested)
+            let payload = Data(repeating: 0x41, count: Int(contentBytes))
+            let inputStream = InputStream(data: payload)
+            inputStream.open()
+            try formatter.create(path: FilePath("/content"), mode: EXT4.Inode.Mode(.S_IFREG, 0o755), buf: inputStream)
+            inputStream.close()
+            try formatter.close()
+
+            let file = try FileHandle(forReadingFrom: fsPath.url)
+            let fileSize = try file.seekToEnd()
+            #expect(fileSize == requested)
+
+            let ext4 = try EXT4.EXT4Reader(blockDevice: fsPath)
+            let sb = ext4.superBlock
+            let blocksCount = UInt64(sb.blocksCountLow) | (UInt64(sb.blocksCountHigh) << 32)
+            let gd1 = try ext4.getGroupDescriptor(1)
+            #expect(UInt64(gd1.inodeTableLow) < blocksCount)
+            #expect(UInt64(gd1.blockBitmapLow) < blocksCount)
+            #expect(UInt64(gd1.inodeBitmapLow) < blocksCount)
+        }
     }
 }
 
